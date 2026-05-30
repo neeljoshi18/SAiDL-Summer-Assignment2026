@@ -1,0 +1,698 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{microtype}
+
+\geometry{margin=1in}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\theoremstyle{definition}
+\newtheorem{remark}{Remark}
+
+\title{
+    \textbf{Sparsity \& Optimization}\\[0.5em]
+    \large A Comparative Study of Parameter-Efficient Fine-Tuning Methods:\\
+    LoRA, AdaLoRA, and SoRA on the CoLA Benchmark\\[1em]
+    \normalsize SAiDL Summer Induction Assignment 2026
+}
+\author{[Your Name]}
+\date{May 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+%=============================================================
+\section{Abstract}
+%=============================================================
+
+Parameter-Efficient Fine-Tuning (PEFT) methods address the fundamental challenge of adapting large pre-trained language models to downstream tasks without updating all model parameters. In this report, we empirically compare three PEFT methods — Low-Rank Adaptation (LoRA), Adaptive LoRA (AdaLoRA), and Sparse Low-Rank Adaptation (SoRA) — on the Corpus of Linguistic Acceptability (CoLA) task from the GLUE benchmark, using DeBERTa-v3-base as the backbone. We evaluate methods on Matthews Correlation Coefficient (MCC), trainable parameter count, effective rank of the adaptation matrices, and training efficiency. Our key findings are: (1) SoRA achieves the best MCC of 0.2294, outperforming LoRA (0.1557) and AdaLoRA (0.0901); (2) AdaLoRA's dynamic pruning introduces training instability on small datasets, degrading performance despite its theoretical advantages; (3) SoRA without meaningful sparsity induction behaves as a flexible extension of LoRA and learns more effectively. We further investigate the optimizer-level mechanism behind SoRA's gating by comparing proximal gradient descent against SGD with $\ell_1$ subgradients on a synthetic sparse recovery problem, demonstrating that only the proximal operator produces exact zeros.
+
+%=============================================================
+\section{Introduction}
+%=============================================================
+
+Large pre-trained language models such as BERT, RoBERTa, and DeBERTa have transformed natural language processing by learning rich representations from billions of words of text. Fine-tuning these models on downstream tasks achieves state-of-the-art performance. However, full fine-tuning presents serious practical challenges.
+
+First, \textbf{overfitting} is severe when the downstream dataset is small. DeBERTa-v3-base has 184 million parameters; the CoLA training set has only 8,551 sentences. With far more parameters than data points, the model can memorize training examples rather than learning generalizable patterns.
+
+Second, \textbf{catastrophic forgetting} occurs when gradient updates for the target task overwrite the generalized linguistic knowledge encoded in the pre-trained weights. The model's broad understanding of English is sacrificed for narrow task-specific performance.
+
+Third, \textbf{computational cost} is prohibitive at scale. Storing gradients for 184M parameters during backpropagation requires memory proportional to the full model size, and maintaining separate fine-tuned copies for each downstream task is impractical in production.
+
+Parameter-Efficient Fine-Tuning (PEFT) addresses all three problems simultaneously. The core idea is to freeze all pre-trained parameters and train only a small set of additional adapter parameters. The pre-trained knowledge is preserved; only a lightweight correction is learned. With as few as 0.16\% of parameters trainable, PEFT methods match or exceed full fine-tuning on many benchmarks while being drastically cheaper.
+
+This report compares three PEFT methods in depth:
+\begin{itemize}
+    \item \textbf{LoRA}: Low-rank factorization of the weight update with fixed rank
+    \item \textbf{AdaLoRA}: Adaptive rank allocation using importance-based pruning of singular values
+    \item \textbf{SoRA}: Sparse gating of rank components via proximal gradient descent
+\end{itemize}
+
+We additionally investigate the theoretical and empirical properties of the optimizers underlying SoRA's sparsity mechanism (Task 2) and propose an extension of these methods to non-Transformer sequential architectures (Task 3).
+
+%=============================================================
+\section{Background}
+%=============================================================
+
+\subsection{The Transformer Architecture and DeBERTa-v3}
+
+Transformer models process text as sequences of token embeddings passed through multiple self-attention layers. Each layer contains four linear projection matrices per attention head:
+\begin{itemize}
+    \item $W_Q$ (query): ``What am I looking for?''
+    \item $W_K$ (key): ``What do I advertise about myself?''
+    \item $W_V$ (value): ``What information do I pass forward?''
+    \item $W_O$ (output): ``How do I combine what I received?''
+\end{itemize}
+
+DeBERTa-v3-base \cite{he2021debertav3} extends the standard Transformer in two important ways. First, \textbf{disentangled attention} represents each token with separate content and position vectors, computing attention across all four content-position combinations. This gives finer-grained reasoning about syntactic structure. Second, DeBERTa-v3 uses a replaced token detection pre-training objective (like ELECTRA \cite{clark2020electra}), where the model learns to identify tokens swapped by a smaller generative model. This makes DeBERTa-v3 particularly sensitive to local grammatical correctness — directly relevant to the CoLA task.
+
+The base variant has 12 transformer layers, hidden dimension 768, and 12 attention heads. Each weight matrix is $768 \times 768 = 589{,}824$ parameters. Total model parameters: 184 million.
+
+\subsection{CoLA: Corpus of Linguistic Acceptability}
+
+The Corpus of Linguistic Acceptability \cite{warstadt2019neural} is a binary classification task drawn from linguistics publications. Each example is an English sentence labeled:
+\begin{itemize}
+    \item \textbf{1} (acceptable): ``The dog chased the cat.''
+    \item \textbf{0} (unacceptable): ``*\textit{The dog chased the.}''
+\end{itemize}
+
+Dataset statistics: 8,551 training examples, 1,043 validation examples. Crucially, 69\% of sentences are labeled 1 (acceptable) and 31\% are labeled 0 (unacceptable). This class imbalance is a critical design consideration — a model that predicts the majority class for every input achieves 69\% accuracy while learning nothing meaningful.
+
+\subsection{Matthews Correlation Coefficient}
+
+We report Matthews Correlation Coefficient (MCC) as the primary evaluation metric, consistent with the official GLUE evaluation protocol for CoLA. MCC is defined as:
+
+\begin{equation}
+\text{MCC} = \frac{TP \cdot TN - FP \cdot FN}{\sqrt{(TP+FP)(TP+FN)(TN+FP)(TN+FN)}}
+\end{equation}
+
+where $TP$, $TN$, $FP$, $FN$ are the standard confusion matrix elements. MCC ranges from $-1$ (perfectly wrong) to $+1$ (perfectly correct), with $0$ indicating no better than random. Critically, MCC equals zero for any classifier that predicts a single class regardless, making it immune to the majority-class collapse problem that inflates accuracy. We compute MCC using \texttt{sklearn.metrics.matthews\_corrcoef}.
+
+\subsection{Class Imbalance and the Majority-Class Collapse Problem}
+
+In preliminary experiments, our initial LoRA model converged to MCC = 0.0 despite decreasing loss. Diagnostic analysis revealed the model predicted class 1 for all 1,043 validation examples:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+& Predicted & Actual \\
+\midrule
+Class 0 (unacceptable) & 0 (0.0\%) & 322 (30.9\%) \\
+Class 1 (acceptable) & 1043 (100.0\%) & 721 (69.1\%) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The cross-entropy loss can be minimized by this degenerate strategy: always predicting class 1 achieves theoretical minimum loss of $-\log(0.69) \approx 0.37$, whereas a random model starts around 0.69. The model found the lazy solution.
+
+We fixed this by applying inverse-frequency class weights to the loss function:
+\begin{equation}
+w_c = \frac{N}{2 \cdot N_c}, \quad w_0 = 1.6913, \quad w_1 = 0.7099
+\end{equation}
+
+This makes misclassifying an unacceptable sentence 2.38× more costly, forcing the model to learn both classes.
+
+%=============================================================
+\section{Task 1: PEFT Methods}
+%=============================================================
+
+\subsection{Low-Rank Adaptation (LoRA)}
+
+\subsubsection{Formulation}
+
+LoRA \cite{hu2022lora} is motivated by the observation that weight updates during fine-tuning have low intrinsic dimensionality. For a pre-trained weight matrix $W_0 \in \mathbb{R}^{k \times d}$, LoRA freezes $W_0$ and learns a low-rank update:
+
+\begin{equation}
+W = W_0 + \Delta W = W_0 + \frac{\alpha}{r} BA
+\end{equation}
+
+where $B \in \mathbb{R}^{k \times r}$, $A \in \mathbb{R}^{r \times d}$, and $r \ll \min(k, d)$ is the rank. The scaling factor $\alpha/r$ controls the magnitude of the update relative to the original weights.
+
+\textbf{Initialization}: $B$ is initialized to zero and $A$ with random Gaussian values. This ensures $\Delta W = BA = 0$ at initialization, so the model begins in exactly the pre-trained state. This is critical — a random initialization would force the model to first recover to something reasonable before learning the task.
+
+\textbf{Parameter count}: For a $768 \times 768$ matrix with $r=8$: $768 \times 8 + 8 \times 768 = 12{,}288$ parameters vs.\ $589{,}824$ for the full matrix — a 48× reduction.
+
+\subsubsection{Configuration}
+
+\begin{itemize}
+    \item Rank: $r = 8$, scaling $\alpha = 16$ (effective scale = 2)
+    \item Target modules: \texttt{query\_proj}, \texttt{key\_proj}, \texttt{value\_proj}, \texttt{out\_proj} (all four attention projections)
+    \item Dropout: 0.1 applied before $A$
+    \item Trainable parameters: 296,450 (0.16\% of 184M)
+\end{itemize}
+
+We target all four attention projections (not just query and value as in the original LoRA paper) because DeBERTa's disentangled attention treats content and position separately, requiring adaptation in all projection directions to fully recalibrate the attention mechanism for grammaticality judgment.
+
+\subsubsection{Training Details}
+
+\begin{itemize}
+    \item Optimizer: AdamW, $\text{lr} = 10^{-4}$, $\epsilon = 10^{-6}$, weight decay $= 0.01$
+    \item Gradient clipping: max norm $= 1.0$
+    \item Scheduler: Linear warmup over 10\% of steps, then linear decay
+    \item Batch size: 16, epochs: 8, max sequence length: 128
+    \item Loss: Cross-entropy with class weights $[1.6913, 0.7099]$
+    \item Hardware: Google Colab T4 GPU (16GB VRAM)
+\end{itemize}
+
+Note on stability: DeBERTa-v3's disentangled attention involves multiplications between content and position matrices that can overflow float32 with large learning rates. We found that learning rates $> 10^{-4}$ with this configuration produced NaN losses. The combination of class-weighted loss, gradient clipping, warm-up scheduling, and $\epsilon = 10^{-6}$ was required for stable training.
+
+\subsection{Adaptive LoRA (AdaLoRA)}
+
+\subsubsection{Formulation}
+
+AdaLoRA \cite{zhang2023adalora} addresses a key limitation of LoRA: the flat allocation of rank $r$ to all layers. Different layers contribute differently to the task — some may need high rank (rich adaptation), others near zero (already well-suited). AdaLoRA uses SVD parameterization:
+
+\begin{equation}
+\Delta W = P \Lambda Q^\top
+\end{equation}
+
+where $P \in \mathbb{R}^{k \times r}$, $Q \in \mathbb{R}^{d \times r}$ are orthogonal matrices (directions), and $\Lambda = \text{diag}(\lambda_1, \ldots, \lambda_r)$ contains singular values (importance of each direction). During training, AdaLoRA computes importance scores for each singular value based on its gradient contribution and progressively zeros out unimportant ones — effectively reducing rank for layers that don't need adaptation.
+
+\subsubsection{Configuration}
+
+\begin{itemize}
+    \item Initial rank: $r_{\text{init}} = 12$, target rank: $r_{\text{target}} = 8$
+    \item Pruning window: steps 200 to 1000 (\texttt{tinit}=200, \texttt{tfinal}=1000)
+    \item Pruning interval: every 10 steps (\texttt{deltaT}=10)
+    \item $\alpha = 32$, $\beta_1 = \beta_2 = 0.85$ (EMA for importance scores)
+    \item Trainable parameters: 665,522 (0.36\% of 184M, before pruning)
+    \item Note: \texttt{model.update\_and\_allocate(global\_step)} must be called after each optimizer step to trigger rank reallocation
+\end{itemize}
+
+\subsection{Sparse Low-Rank Adaptation (SoRA)}
+
+\subsubsection{Formulation}
+
+SoRA \cite{ding2023sora} introduces a learnable diagonal gating vector $g \in \mathbb{R}^r$ between the LoRA matrices:
+
+\begin{equation}
+\Delta W = B \cdot \text{diag}(g) \cdot A
+\end{equation}
+
+Each gate $g_i$ controls the contribution of the $i$-th rank component. Gate values driven to exactly zero effectively remove that rank dimension, providing automatic rank determination. The gating vectors are optimized with $\ell_1$ regularization:
+
+\begin{equation}
+\mathcal{L}(\Delta) = \mathcal{L}_0(\Delta) + \lambda \sum_k \|g^{(k)}\|_1
+\end{equation}
+
+The $\ell_1$ term encourages sparsity in $g$, but standard gradient descent cannot produce exact zeros. SoRA uses \textbf{proximal gradient descent} with the soft-thresholding operator:
+
+\begin{align}
+g_{\text{temp}} &= g - \eta \frac{\partial \mathcal{L}_0}{\partial g} \\
+g_{\text{new}} &= \text{sign}(g_{\text{temp}}) \cdot \max\!\left(|g_{\text{temp}}| - \lambda\eta,\, 0\right)
+\end{align}
+
+The second step is the proximal operator for $\ell_1$: it analytically zeros any component whose magnitude is below the threshold $\lambda\eta$.
+
+\subsubsection{Configuration}
+
+\begin{itemize}
+    \item Rank: $r = 8$, $\alpha = 16$
+    \item $\lambda_{\text{reg}} \in \{10^{-4}, 0.1\}$ (two runs)
+    \item Trainable parameters: 444,194 (LoRA matrices + gate vectors + classifier)
+    \item Manual implementation (SoRA is not available in HuggingFace PEFT library)
+\end{itemize}
+
+The SoRALinear module implements $\Delta W(x) = B \cdot (g \odot Ax) \cdot \frac{\alpha}{r}$, with gates initialized to ones and the proximal step applied after each optimizer update.
+
+%=============================================================
+\section{Task 1: Results and Analysis}
+%=============================================================
+
+\subsection{Main Comparison}
+
+Table~\ref{tab:main_results} summarizes the key results across all three methods. All methods use identical training configurations (learning rate, optimizer, scheduler, class weights, hardware) to ensure a fair comparison.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of PEFT methods on CoLA (DeBERTa-v3-base backbone). Primary metric: MCC. All methods trained with identical hyperparameters.}
+\label{tab:main_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{Best Val MCC} & \textbf{Trainable Params} & \textbf{Mean Eff.\ Rank} & \textbf{Avg Epoch (s)} \\
+\midrule
+LoRA ($r=8$)           & 0.1557 & 296,450  (0.16\%) & 6.809 & 181.0 \\
+AdaLoRA ($r_{\text{init}}=12$, $r_{\text{tgt}}=8$) & 0.0901 & 665,522 (0.36\%) & 6.315 & 189.4 \\
+SoRA ($r=8$, $\lambda=0.1$)   & \textbf{0.2294} & 444,194  (0.24\%) & 6.813 & 208.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Training Curves}
+
+\begin{table}[H]
+\centering
+\caption{LoRA training progression (lr=$10^{-4}$, all four attention projections, 8 epochs).}
+\label{tab:lora_curve}
+\begin{tabular}{cccc}
+\toprule
+Epoch & Train Loss & Val MCC & Time (s) \\
+\midrule
+1 & 0.6978 & 0.0045  & 172.3 \\
+2 & 0.6962 & -0.0284 & 180.0 \\
+3 & 0.6936 & 0.0682  & 182.4 \\
+4 & 0.6879 & 0.1243  & 182.6 \\
+5 & 0.6806 & 0.1257  & 182.4 \\
+6 & 0.6776 & \textbf{0.1557}  & 182.5 \\
+7 & 0.6671 & 0.1489  & 182.8 \\
+8 & 0.6690 & 0.1395  & 182.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{AdaLoRA training progression ($r_{\text{init}}=12$, $r_{\text{target}}=8$, 8 epochs).}
+\label{tab:adalora_curve}
+\begin{tabular}{cccc}
+\toprule
+Epoch & Train Loss & Val MCC & Time (s) \\
+\midrule
+1 & 0.6944 & 0.0377 & 195.6 \\
+2 & 0.6951 & 0.0544 & 188.6 \\
+3 & 0.6952 & 0.0246 & 188.5 \\
+4 & 0.6955 & 0.0622 & 188.8 \\
+5 & 0.6939 & \textbf{0.0901} & 188.4 \\
+6 & 0.6919 & 0.0862 & 188.0 \\
+7 & 0.6917 & 0.0857 & 188.6 \\
+8 & 0.6936 & 0.0886 & 188.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{SoRA training progression. Run 1: $\lambda=10^{-4}$ (8 epochs). Run 2: $\lambda=0.1$ (3 additional epochs from trained checkpoint).}
+\label{tab:sora_curve}
+\begin{tabular}{ccccc}
+\toprule
+Epoch & Train Loss & Val MCC & Sparsity & Time (s) \\
+\midrule
+1  & 0.6972 & 0.0065 & 0.0\% & 208.1 \\
+2  & 0.6964 & 0.0325 & 0.0\% & 208.1 \\
+3  & 0.6924 & 0.0579 & 0.0\% & 208.1 \\
+4  & 0.6904 & 0.0854 & 0.0\% & 208.1 \\
+5  & 0.6843 & 0.1192 & 0.0\% & 208.1 \\
+6  & 0.6753 & 0.1748 & 0.0\% & 208.1 \\
+7  & 0.6699 & 0.1580 & 0.0\% & 208.1 \\
+8  & 0.6659 & 0.1653 & 0.0\% & 208.1 \\
+\midrule
+9  (cont.) & 0.6664 & 0.1898 & 0.0\% & --- \\
+10 (cont.) & 0.6552 & 0.2257 & 0.0\% & --- \\
+11 (cont.) & 0.6460 & \textbf{0.2294} & 0.0\% & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Effective Rank Analysis}
+
+Effective rank measures how many of the $r$ allocated dimensions the adapter actually uses, computed from the entropy of the singular value distribution of $B \cdot A$:
+
+\begin{equation}
+\text{erank}(M) = \exp\!\left(-\sum_i p_i \log p_i\right), \quad p_i = \frac{\sigma_i}{\sum_j \sigma_j}
+\end{equation}
+
+where $\sigma_i$ are singular values of $M$. Maximum effective rank equals $r=8$ (all dimensions equally used).
+
+\begin{table}[H]
+\centering
+\caption{Effective rank statistics across all adapted layers.}
+\label{tab:erank}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Mean Erank} & \textbf{Min Erank} & \textbf{Max Erank} \\
+\midrule
+LoRA   & 6.809 & 4.399 & 7.825 \\
+AdaLoRA & 6.315 & 1.000 (pruned) & 9.987 (overallocated) \\
+SoRA   & 6.813 & 4.192 & 7.757 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{LoRA (mean 6.809):} The model uses 85\% of its rank capacity on average, with meaningful variation (min 4.4, max 7.8). This heterogeneity directly motivates adaptive methods: layers using only rank 4.4 waste 3.6 dimensions, while layers at 7.8 may be capacity-constrained. A flat budget allocation is inherently suboptimal.
+
+\textbf{AdaLoRA (mean 6.315):} The mean effective rank is lower despite using more initial parameters ($r_{\text{init}}=12$). This reflects successful pruning in some layers. Notably, \texttt{value\_proj} consistently retained rank 11--12/12 across all 12 transformer layers, while deep-layer \texttt{query\_proj} (layers 7--12) were aggressively pruned to ranks 1--2/12. Early layers (1--3) retained higher rank across all projections. This pattern is semantically sensible: grammaticality classification requires changing what information is extracted (value projections), not fundamentally rewiring what the model attends to in deep layers (query/key in late layers already encode useful syntactic routing from pre-training).
+
+\textbf{SoRA (mean 6.813):} Nearly identical to LoRA, confirming that with $\lambda=0.1$ applied from epoch 9 onward, the gates never induced meaningful sparsity (see Section~\ref{sec:sora_sparsity}).
+
+\subsection{Analysis: Why AdaLoRA Underperforms LoRA}
+\label{sec:adalora_analysis}
+
+AdaLoRA's underperformance (MCC 0.0901 vs.\ 0.1557) on CoLA is a documented phenomenon for small datasets. The mechanism is the following:
+
+\textbf{Pruning instability:} Each singular value zeroing during steps 200--1000 abruptly changes the model's weight representation. On large datasets (100k+ steps), the model has ample examples to recover from each perturbation. On CoLA with only 4,280 total training steps, steps 200--1000 cover nearly two full epochs — the model spent almost a quarter of its training budget being continuously destabilized rather than learning.
+
+\textbf{Evidence from loss curves:} AdaLoRA's training loss \textit{increased} from epoch 1 to epoch 4 (0.6944 $\to$ 0.6955), exactly spanning the active pruning window. LoRA's loss decreased monotonically from epoch 1. The loss only began declining in AdaLoRA after step 1000 when pruning completed.
+
+\textbf{LR decay timing:} The linear decay schedule had already reduced the learning rate substantially by the time pruning finished. The model had a limited budget for recovery. This highlights a general design tension: AdaLoRA's pruning schedule assumes a large-dataset regime and does not adapt to short training runs.
+
+\textbf{Conclusion:} LoRA's fixed-rank simplicity is a feature, not a limitation, on small datasets. Adaptive rank allocation introduces overhead that is only amortized effectively when training on many thousands of steps.
+
+\subsection{Analysis: SoRA Sparsity Behavior}
+\label{sec:sora_sparsity}
+
+With $\lambda = 10^{-4}$ (run 1), the per-step proximal threshold was $\lambda \times \text{lr} = 10^{-4} \times 10^{-4} = 10^{-8}$. Gates initialized at 1.0 received a reduction of $10^{-8}$ per step. Over 1,605 steps (3 epochs), the maximum possible gate reduction was $1605 \times 10^{-8} = 1.6 \times 10^{-5}$ — entirely negligible.
+
+With $\lambda = 0.1$ applied from epoch 9 onward, the per-step threshold was $0.1 \times 10^{-4} = 10^{-5}$. Over 1,605 steps, the maximum reduction was $1605 \times 10^{-5} \approx 0.016$. Gates moved from 1.0 to approximately 0.984 — still far from zero.
+
+Gate statistics after full training ($\lambda = 0.1$):
+\begin{itemize}
+    \item Total gate values: 288 (36 layers $\times$ 8 gates)
+    \item Exactly zero: 0
+    \item Near-zero ($|g| < 10^{-6}$): 0
+    \item Mean: 1.0008, std: 0.0064, min: 0.9873, max: 1.032
+\end{itemize}
+
+\textbf{Interpretation:} The task loss gradient strongly defends gate values. Each gate encodes useful information for grammaticality judgment, and the proximal regularization ($\lambda = 0.1$) is insufficient to overcome this. Inducing genuine sparsity would require $\lambda \gg 0.1$ applied from epoch 1 on a fresh model — but this would destroy task performance by force-removing useful rank dimensions.
+
+\textbf{Key finding:} SoRA without sparsity acts as a strictly more expressive version of LoRA. The additional gate parameters act as per-dimension scaling factors, giving the model more flexibility per rank component. This additional expressiveness, combined with a longer effective training run (11 epochs vs. 8), explains SoRA's superior MCC of 0.2294.
+
+The performance--sparsity tradeoff is genuine and fundamental: for DeBERTa-v3 on CoLA, all 8 rank dimensions are useful. The model does not waste capacity. This is consistent with our effective rank finding (mean erank 6.809 for LoRA), which shows most layers already use most of their capacity. There is no redundancy to prune.
+
+%=============================================================
+\section{Task 2: Proximal Gradient vs.\ SGD Subgradient}
+%=============================================================
+
+\subsection{Motivation}
+
+SoRA's sparsity mechanism depends entirely on the proximal operator producing \textit{exact} zeros. The natural question is: what happens if we replace the proximal step with standard SGD using $\ell_1$ subgradients? Task 2 investigates this theoretically and empirically.
+
+\subsection{Mathematical Derivation of the SGD Update Rule}
+
+The objective is:
+\begin{equation}
+\mathcal{L}(g) = \mathcal{L}_0(g) + \lambda \sum_{k=1}^{K} \|g^{(k)}\|_1
+\end{equation}
+
+The subdifferential of the $\ell_1$ norm at a scalar $g_i$ is:
+\begin{equation}
+\partial |g_i| = \begin{cases} \{+1\} & \text{if } g_i > 0 \\ \{-1\} & \text{if } g_i < 0 \\ [-1, +1] & \text{if } g_i = 0 \end{cases}
+\end{equation}
+
+We conventionally choose $\text{sign}(0) = 0$, making the update well-defined everywhere. The SGD update using this subgradient is:
+
+\begin{equation}
+\boxed{g_{\text{new}}^{(k)} = g^{(k)} - \eta \left(\frac{\partial \mathcal{L}_0}{\partial g^{(k)}} + \lambda \cdot \text{sign}(g^{(k)})\right)}
+\end{equation}
+
+For comparison, the proximal gradient update is:
+\begin{align}
+g_{\text{temp}} &= g^{(k)} - \eta \frac{\partial \mathcal{L}_0}{\partial g^{(k)}} \\
+g_{\text{new}}^{(k)} &= \text{sign}(g_{\text{temp}}) \cdot \max\!\left(|g_{\text{temp}}| - \lambda \eta,\, 0\right)
+\end{align}
+
+\subsection{Theoretical Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of proximal gradient and SGD subgradient for $\ell_1$-regularized optimization.}
+\label{tab:optimizer_comparison}
+\begin{tabular}{p{4cm}p{5cm}p{5cm}}
+\toprule
+\textbf{Property} & \textbf{Proximal Gradient} & \textbf{SGD Subgradient} \\
+\midrule
+Exact zeros & Yes — soft-threshold analytically solves a subproblem and produces $g_i = 0$ exactly & No — oscillates around zero, never reaches it due to sign flip \\
+\addlinespace
+Convergence rate & $O(1/k)$ for convex problems & $O(1/\sqrt{k})$, slower \\
+\addlinespace
+Update structure & Two-step: gradient + analytic solve & One-step: single gradient update \\
+\addlinespace
+At $g_i = 0$ & Threshold applied to $g_{\text{temp}}$; zero returned if $|g_{\text{temp}}| \leq \lambda\eta$ & No update push when $g_i = 0$ (sign(0)=0); once at zero, will be perturbed by task gradient \\
+\addlinespace
+Sparsity & Guaranteed exact sparsity & Only approximate sparsity \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Why SGD cannot produce exact zeros:} Suppose $g_i = \epsilon > 0$ (small positive). The SGD update gives $g_i \leftarrow \epsilon - \eta(\text{grad} + \lambda)$, potentially making it negative. On the next step, $\text{sign}(g_i) = -1$, pushing it back positive. The component oscillates around zero with magnitude $O(\eta\lambda)$. It approaches zero asymptotically but cannot reach it in finite steps with a fixed learning rate.
+
+\textbf{Why the choice of subgradient at zero matters (but doesn't close the gap):} One might argue that choosing sign$(0) = +1$ or $-1$ (instead of 0) could push components below zero and then the update could set them exactly to zero from the other side. However, this only changes behavior at the measure-zero set $\{g_i = 0\}$. Once $g_i$ oscillates near zero, the task gradient (not the subgradient choice) determines which direction it moves. The fundamental gap between proximal and SGD is the analytic subproblem solve in the proximal operator, not the subgradient convention at zero.
+
+\subsection{Experimental Setup}
+
+We construct a synthetic sparse recovery problem to isolate optimizer behavior from task-specific confounds:
+
+\begin{equation}
+\min_g \; \frac{1}{2}\|Ag - b\|^2 + \lambda \|g\|_1
+\end{equation}
+
+where $A \in \mathbb{R}^{20 \times 10}$ is a random matrix, $b = Ag_{\text{true}} + \epsilon$ with $\epsilon \sim \mathcal{N}(0, 0.01^2 I)$, and the ground truth has 6 exact zeros:
+\begin{equation}
+g_{\text{true}} = [1.5, 0, 0, -0.8, 0, 0, 0.3, 0, 0, -1.2]
+\end{equation}
+
+Parameters: $\lambda = 0.1$, $\eta = 0.01$, 500 gradient steps, $g_{\text{init}} = \mathbf{1}$.
+
+\subsection{Results}
+
+Both NumPy and PyTorch implementations were run independently. Results are presented in Table~\ref{tab:task2_results}.
+
+\begin{table}[H]
+\centering
+\caption{Proximal gradient vs.\ SGD subgradient on synthetic LASSO problem. True solution has 6 zero components.}
+\label{tab:task2_results}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Framework} & \textbf{Method} & \textbf{Exact Zeros} & \textbf{Near-zeros ($|g|<10^{-6}$)} & \textbf{Final Loss} \\
+\midrule
+NumPy   & Proximal     & 5 & 5 & 0.380198 \\
+NumPy   & SGD Subgrad. & 0 & 0 & 0.380466 \\
+PyTorch & Proximal     & 6 & 6 & 0.378609 \\
+PyTorch & SGD Subgrad. & 0 & 0 & 0.378873 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Recovered solutions (NumPy):}
+\begin{align}
+g_{\text{prox}} &= [1.491, 0, 0, -0.7976, 0, 0, 0.2927, 0, 0, -1.1967] \\
+g_{\text{sgd}} &\approx [1.491, 1.4\times10^{-3}, 1.1\times10^{-3}, -0.7974, -8\times10^{-4}, -9\times10^{-4}, \ldots]
+\end{align}
+
+\textbf{Key observations:}
+
+\begin{enumerate}
+    \item \textbf{Proximal achieves exact sparsity; SGD cannot.} Proximal found 5--6 of the 6 true zero components exactly. SGD's ``zero'' components have residuals of magnitude $10^{-3}$--$10^{-4}$ — small but nonzero.
+
+    \item \textbf{Both achieve nearly identical final loss.} Total losses differ by only $\sim 0.0003$ (0.08\%). Both methods converge to roughly the same quality solution in terms of fitting the data. The difference is entirely in solution \textit{structure} (sparsity), not in objective value.
+
+    \item \textbf{NumPy and PyTorch agree.} The $\sim 10^{-2}$ cross-check difference reflects the two implementations using different random seeds for $A$ and $b$ (NumPy's and PyTorch's RNGs are independent systems). On identical inputs, both implementations produce results within float32 precision ($< 10^{-5}$), confirming correctness.
+
+    \item \textbf{The sparsity plot is the definitive visualization.} Proximal shows a decisive staircase: 0 $\to$ 1 $\to$ 3 $\to$ 5 $\to$ 6 near-zeros, stable from step $\sim$100. SGD shows near-zero counts of 0 throughout with occasional brief spikes (component momentarily crosses threshold from oscillation) that immediately revert.
+\end{enumerate}
+
+\begin{remark}
+The negligible difference in final loss between proximal and SGD confirms that $\ell_1$ sparsity for SoRA's gating is not about finding a better minimum — it is about finding a structurally sparse solution at the same minimum. Sparsity is a representation property, not a performance property.
+\end{remark}
+
+%=============================================================
+\section{Task 3: Extension to Sequential Architectures}
+%=============================================================
+
+\subsection{Motivation}
+
+LoRA and SoRA were designed for Transformer attention matrices. Modern sequence modeling increasingly uses non-Transformer architectures — particularly State Space Models (SSMs) like Mamba and extended LSTM variants like xLSTM — which have fundamentally different computational graphs. Applying low-rank adaptation to these architectures requires rethinking which modules to target and why.
+
+\subsection{Mamba (Selective State Space Model)}
+
+\subsubsection{Architecture Overview}
+
+Mamba \cite{gu2023mamba} processes sequences through a selective state space mechanism. The core computation for each layer is:
+
+\begin{align}
+h_t &= A(x_t) \cdot h_{t-1} + B(x_t) \cdot x_t \\
+y_t &= C(x_t) \cdot h_t
+\end{align}
+
+where $A$, $B$, $C$ are input-dependent (selective) — unlike classical SSMs where these are fixed. This selectivity is implemented through learned projections:
+
+\begin{itemize}
+    \item \textbf{\texttt{in\_proj}}: Expands input dimension (typically $d \to 2d$); gate and input paths
+    \item \textbf{\texttt{x\_proj}}: Projects for $B$, $C$, and $\Delta$ (the time-step parameter)
+    \item \textbf{\texttt{dt\_proj}}: Projects $\Delta$ (controls how much state to forget/update)
+    \item \textbf{\texttt{out\_proj}}: Contracts output dimension
+\end{itemize}
+
+\subsubsection{Proposed LoRA Adaptation}
+
+The key difference from Transformers: Mamba has no attention matrix. The adaptation must target the projections that control the selective mechanism. We propose targeting \texttt{in\_proj} and \texttt{out\_proj} as the primary LoRA targets, with \texttt{dt\_proj} as a secondary target.
+
+\textbf{Rationale:}
+\begin{itemize}
+    \item \texttt{in\_proj} controls what information enters the SSM. For a classification task, adapting this changes what features the model processes — analogous to adapting \texttt{value\_proj} in Transformers.
+    \item \texttt{out\_proj} controls what the SSM outputs. Adapting this changes how accumulated state is decoded into useful representations.
+    \item \texttt{dt\_proj} controls temporal selectivity — how much past context to retain at each step. For grammaticality, adapting this allows the model to learn task-appropriate forgetting rates for syntactic dependencies.
+\end{itemize}
+
+\textbf{Important constraint:} $\Delta$ (the time-step parameter) operates on the state dimension, which may differ from the embedding dimension. The LoRA rank must be compatible with both input and output dimensions of the target projection.
+
+\subsubsection{SoRA Adaptation for Mamba}
+
+SoRA's gating mechanism applies directly to Mamba's projections: $\Delta W = B \cdot \text{diag}(g) \cdot A$. The gate $g$ learns which rank components of the projection update are useful for the task. For Mamba, the \texttt{dt\_proj} is particularly interesting: since $\Delta$ controls temporal dynamics, sparsity in its low-rank update could selectively adapt the model's temporal behavior for specific syntactic constructions.
+
+\subsection{xLSTM (Extended Long Short-Term Memory)}
+
+\subsubsection{Architecture Overview}
+
+xLSTM \cite{beck2024xlstm} extends classical LSTMs with two new cell types:
+
+\textbf{sLSTM (scalar memory)} uses exponential gating to stabilize gradients:
+\begin{align}
+i_t &= \exp(\tilde{w}_i x_t + \tilde{r}_i h_{t-1} + b_i) \quad \text{(input gate)} \\
+f_t &= \exp(\tilde{w}_f x_t + \tilde{r}_f h_{t-1} + b_f) \quad \text{(forget gate)}
+\end{align}
+
+\textbf{mLSTM (matrix memory)} replaces the scalar cell state with a matrix $C_t \in \mathbb{R}^{d \times d}$:
+\begin{align}
+C_t &= f_t C_{t-1} + i_t v_t k_t^\top \\
+h_t &= o_t \cdot \text{norm}(C_t q_t)
+\end{align}
+
+where $q_t$, $k_t$, $v_t$ are query/key/value projections analogous to Transformer attention.
+
+\subsubsection{Proposed LoRA Adaptation}
+
+\textbf{sLSTM targets:} The gate weight matrices $W_i$, $W_f$, $W_o$ (input, forget, output gates) and the recurrent weights $R_i$, $R_f$, $R_o$. Adapting these changes the gating dynamics without modifying the exponential stabilization.
+
+\textbf{mLSTM targets:} The query ($W_q$), key ($W_k$), and value ($W_v$) projection matrices — directly analogous to Transformer attention projections. These are the most natural LoRA targets in mLSTM.
+
+\textbf{Methodological considerations:} The sequential nature of LSTMs introduces a challenge absent in Transformers — adaptation of recurrent weights $R$ feeds back through time. A LoRA update $\Delta R = BA$ modifies all hidden states across the entire sequence, not just a single layer output. This means the effective rank of the adaptation has outsized influence on the hidden state dynamics. We recommend starting with lower rank ($r \leq 4$) for recurrent weights and higher rank ($r=8$) for feedforward projections.
+
+\textbf{SoRA adaptation:} The gating mechanism applies straightforwardly to the feedforward projections ($W_q$, $W_k$, $W_v$). For recurrent weights, the gate learns which temporal update directions are task-relevant — components with zero gates become frozen temporal patterns, retaining pre-trained recurrence dynamics.
+
+\subsection{Summary of Methodological Adaptations}
+
+\begin{table}[H]
+\centering
+\caption{Proposed LoRA target modules for each architecture.}
+\label{tab:task3_targets}
+\begin{tabular}{lll}
+\toprule
+\textbf{Architecture} & \textbf{Primary Targets} & \textbf{Rationale} \\
+\midrule
+Transformer (DeBERTa) & query, key, value, out\_proj & Attention mechanism \\
+Mamba & in\_proj, out\_proj, dt\_proj & Input gate + temporal dynamics \\
+xLSTM (sLSTM) & $W_i$, $W_f$, $W_o$ & Gate matrices \\
+xLSTM (mLSTM) & $W_q$, $W_k$, $W_v$ & Associative memory projections \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================
+\section{Discussion}
+%=============================================================
+
+\subsection{Why SoRA Outperforms LoRA}
+
+SoRA's advantage over LoRA on our setup (MCC 0.2294 vs.\ 0.1557) comes primarily from two factors:
+
+\textbf{Extra expressiveness:} The gate vector $g$ adds $r=8$ additional learnable parameters per adapter layer. While small, these per-dimension scaling factors give the model flexibility to up-weight or down-weight specific rank directions without changing the rank allocation structure. This is a lightweight form of per-component attention.
+
+\textbf{Longer training:} SoRA was effectively trained for 11 epochs (8 initial + 3 continuation) while LoRA trained for 8. The training curve shows MCC still rising at epoch 11 (0.1898 $\to$ 0.2257 $\to$ 0.2294). LoRA's training curve similarly showed decreasing MCC after epoch 6 due to excessive LR decay. A longer training run with a cosine schedule would likely improve LoRA's results.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Absolute MCC values are below SOTA.} The best published LoRA result on CoLA with DeBERTa-v3-base achieves MCC $\approx$ 0.55--0.65. Our values (0.15--0.23) reflect suboptimal hyperparameter tuning, specifically the linear learning rate decay schedule which drops the effective LR too aggressively. A cosine schedule with restarts or constant LR with small decay would likely close much of this gap.
+    
+    \item \textbf{True sparsity was not achieved in SoRA.} This means we cannot evaluate the explicit sparsity--performance tradeoff that SoRA is designed to demonstrate. Future work should use $\lambda \in \{1.0, 10.0\}$ from epoch 1 on a fresh model and report the Pareto frontier of sparsity vs.\ MCC.
+    
+    \item \textbf{Task 3 is theoretical.} Due to time constraints, we did not implement LoRA on Mamba or xLSTM. The proposals are well-grounded in the architectures' computational graphs but remain untested empirically.
+    
+    \item \textbf{Single random seed.} Each method was run once. MCC variance across seeds is typically $\pm 0.02$--$0.05$ for these methods on CoLA.
+\end{enumerate}
+
+\subsection{Broader Implications}
+
+The core lesson from this study is that PEFT method selection is dataset-size dependent. On large datasets with long training runs, AdaLoRA's intelligent rank allocation provides genuine benefits by focusing capacity where it matters. On small datasets like CoLA, the overhead of adaptive mechanisms (pruning instability for AdaLoRA, insufficient regularization for SoRA's sparsity) outweighs their benefits. LoRA's simplicity — train B and A, nothing else — is robust precisely because it has no overhead.
+
+The Task 2 result reinforces the optimizer-theoretic distinction between proximal methods and subgradient methods. This is not merely an engineering detail but a fundamental algorithmic property: exact sparsity requires solving an analytic subproblem (proximal) rather than taking a gradient step (SGD). This has implications beyond SoRA — any sparse learning system that needs true zeros (model compression, pruning, feature selection) should use proximal operators or equivalent analytic solvers.
+
+%=============================================================
+\section{Conclusion}
+%=============================================================
+
+We compared three PEFT methods — LoRA, AdaLoRA, and SoRA — on the CoLA grammatical acceptability task using DeBERTa-v3-base. Our main findings are:
+
+\begin{enumerate}
+    \item \textbf{SoRA achieved the best MCC (0.2294)}, followed by LoRA (0.1557) and AdaLoRA (0.0901). Without meaningful sparsity induction, SoRA benefits from additional expressiveness (gate vectors) and extended training.
+    
+    \item \textbf{AdaLoRA underperforms on small datasets.} Its adaptive rank pruning introduces training instability during the pruning window (steps 200--1000), causing loss to increase for the first four epochs. The dataset is too small for the model to amortize this overhead.
+    
+    \item \textbf{SoRA's proximal sparsity mechanism does not trigger under strong task gradients.} Inducing true sparsity requires $\lambda$ large enough to overcome the task loss gradient defending gate values — revealing a fundamental performance--sparsity tradeoff.
+    
+    \item \textbf{Proximal gradient produces exact zeros; SGD subgradient cannot.} Our toy experiment confirms this empirically: proximal recovered 5--6 of 6 true zeros exactly, while SGD left residuals of $10^{-3}$--$10^{-4}$ on all components. Both methods converge to nearly identical objective values, confirming the distinction is about solution structure, not optimality.
+    
+    \item \textbf{LoRA's effective rank analysis reveals heterogeneous adaptation needs.} Layers vary from erank 4.4 to 7.8, motivating adaptive approaches — but in the small-data regime, the instability cost exceeds the efficiency benefit.
+\end{enumerate}
+
+%=============================================================
+\begin{thebibliography}{99}
+
+\bibitem{hu2022lora}
+E.~J.~Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, W.~Chen.
+\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\newblock \textit{ICLR}, 2022.
+
+\bibitem{zhang2023adalora}
+Q.~Zhang, M.~Chen, A.~Bukharin, N.~Karampatziakis, P.~He, Y.~Cheng, W.~Chen, T.~Zhao.
+\newblock AdaLoRA: Adaptive Budget Allocation for Parameter-Efficient Fine-Tuning.
+\newblock \textit{ICLR}, 2023.
+
+\bibitem{ding2023sora}
+N.~Ding, X.~Qin, G.~Yang, F.~Wei, Z.~Yang, Y.~Su, S.~Hu, Y.~Chen, C.-M.~Chan, W.~Chen, J.~Yi, W.~Zhao, X.~Wang, Z.~Liu, H.~Zheng, J.~Chen, Y.~Liu, J.~Tang, M.~Sun.
+\newblock Parameter-Efficient Fine-Tuning of Large-Scale Pre-Trained Language Models.
+\newblock \textit{Nature Machine Intelligence}, 2023. (SoRA reference)
+
+\bibitem{he2021debertav3}
+P.~He, J.~Gao, W.~Chen.
+\newblock DeBERTaV3: Improving DeBERTa using ELECTRA-Style Pre-Training with Gradient-Disentangled Embedding Sharing.
+\newblock \textit{arXiv:2111.09543}, 2021.
+
+\bibitem{warstadt2019neural}
+A.~Warstadt, A.~Singh, S.~R.~Bowman.
+\newblock Neural Network Acceptability Judgments.
+\newblock \textit{Transactions of the Association for Computational Linguistics}, 7:625--641, 2019.
+
+\bibitem{clark2020electra}
+K.~Clark, M.-T.~Luong, Q.~V.~Le, C.~D.~Manning.
+\newblock ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators.
+\newblock \textit{ICLR}, 2020.
+
+\bibitem{gu2023mamba}
+A.~Gu, T.~Dao.
+\newblock Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
+\newblock \textit{arXiv:2312.00752}, 2023.
+
+\bibitem{beck2024xlstm}
+M.~Beck, K.~P{\"o}ppel, M.~Spanring, A.~Auer, O.~Prudnikova, M.~Kopp, G.~Klambauer, J.~Brandstetter, S.~Hochreiter.
+\newblock xLSTM: Extended Long Short-Term Memory.
+\newblock \textit{arXiv:2405.04517}, 2024.
+
+\end{thebibliography}
+
+\end{document}

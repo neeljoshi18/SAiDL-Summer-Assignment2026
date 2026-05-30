@@ -1,0 +1,51 @@
+{
+  "method": "AdaLoRA",
+  "backbone": "microsoft/deberta-v3-base",
+  "task": "CoLA (GLUE)",
+  "config": {
+    "init_r": 12,
+    "target_r": 8,
+    "lora_alpha": 32,
+    "beta1": 0.85,
+    "beta2": 0.85,
+    "tinit": 200,
+    "tfinal": 1000,
+    "deltaT": 10,
+    "target_modules": ["query_proj", "key_proj", "value_proj"],
+    "lr": 1e-4,
+    "weight_decay": 0.01,
+    "eps": 1e-6,
+    "batch_size": 16,
+    "epochs": 8,
+    "total_steps": 4280,
+    "max_seq_length": 128,
+    "class_weights": [1.6913, 0.7099],
+    "gradient_clip_max_norm": 1.0,
+    "warmup_fraction": 0.1,
+    "scheduler": "linear_warmup_linear_decay"
+  },
+  "trainable_params": 665522,
+  "total_params": 184720132,
+  "trainable_pct": 0.3602,
+  "training_curves": {
+    "epoch":           [1, 2, 3, 4, 5, 6, 7, 8],
+    "train_loss":      [0.6944, 0.6951, 0.6952, 0.6955, 0.6939, 0.6919, 0.6917, 0.6936],
+    "val_mcc":         [0.0377, 0.0544, 0.0246, 0.0622, 0.0901, 0.0862, 0.0857, 0.0886],
+    "epoch_time_sec":  [195.6, 188.6, 188.5, 188.8, 188.4, 188.0, 188.6, 188.9]
+  },
+  "best_val_mcc": 0.0901,
+  "best_epoch": 5,
+  "avg_epoch_time_sec": 189.4,
+  "effective_rank": {
+    "mean": 6.315,
+    "min": 1.000,
+    "max": 9.987,
+    "init_rank": 12,
+    "target_rank": 8,
+    "layers_with_full_rank": 9,
+    "layers_pruned": 27,
+    "notes": "value_proj keeps rank 11-12/12 throughout. Deep query_proj layers 7-12 pruned to rank 1-2/12."
+  },
+  "hardware": "Google Colab T4 GPU (16GB VRAM)",
+  "analysis_note": "Training loss increased for first 4 epochs (pruning instability window steps 200-1000). AdaLoRA validated on larger datasets; pruning overhead not amortized over CoLA's 8551 examples."
+}

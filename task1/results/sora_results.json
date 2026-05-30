@@ -1,0 +1,63 @@
+{
+  "method": "SoRA",
+  "backbone": "microsoft/deberta-v3-base",
+  "task": "CoLA (GLUE)",
+  "config": {
+    "r": 8,
+    "lora_alpha": 16,
+    "target_modules": ["query_proj", "key_proj", "value_proj", "out_proj"],
+    "lora_dropout": 0.1,
+    "lambda_reg_run1": 1e-4,
+    "lambda_reg_run2": 0.1,
+    "lr": 1e-4,
+    "weight_decay": 0.01,
+    "eps": 1e-6,
+    "batch_size": 16,
+    "epochs_run1": 8,
+    "epochs_run2": 3,
+    "total_effective_epochs": 11,
+    "max_seq_length": 128,
+    "class_weights": [1.6913, 0.7099],
+    "gradient_clip_max_norm": 1.0,
+    "warmup_fraction": 0.1,
+    "scheduler": "linear_warmup_linear_decay",
+    "implementation": "manual SoRALinear (not in HuggingFace PEFT)"
+  },
+  "trainable_params": 444194,
+  "total_params": 184720132,
+  "trainable_pct": 0.2404,
+  "training_curves_run1": {
+    "epoch":       [1, 2, 3, 4, 5, 6, 7, 8],
+    "train_loss":  [0.6972, 0.6964, 0.6924, 0.6904, 0.6843, 0.6753, 0.6699, 0.6659],
+    "val_mcc":     [0.0065, 0.0325, 0.0579, 0.0854, 0.1192, 0.1748, 0.1580, 0.1653],
+    "sparsity_pct":[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "epoch_time_sec": [208.1, 208.1, 208.1, 208.1, 208.1, 208.1, 208.1, 208.1]
+  },
+  "training_curves_run2_continuation": {
+    "epoch":       [9, 10, 11],
+    "train_loss":  [0.6664, 0.6552, 0.6460],
+    "val_mcc":     [0.1898, 0.2257, 0.2294],
+    "sparsity_pct":[0.0, 0.0, 0.0]
+  },
+  "best_val_mcc": 0.2294,
+  "best_epoch": 11,
+  "avg_epoch_time_sec": 208.1,
+  "gate_analysis": {
+    "total_gate_values": 288,
+    "exact_zeros": 0,
+    "near_zeros_1e6": 0,
+    "gate_mean": 1.0008,
+    "gate_std": 0.0064,
+    "gate_min": 0.9873,
+    "gate_max": 1.032
+  },
+  "effective_rank": {
+    "mean": 6.813,
+    "min": 4.192,
+    "max": 7.757,
+    "max_possible": 8,
+    "notes": "Near-identical to LoRA (6.809). Zero gates pruned; lambda too small to overcome task gradient."
+  },
+  "hardware": "Google Colab T4 GPU (16GB VRAM)",
+  "analysis_note": "Proximal threshold lambda*lr = 1e-4*1e-4 = 1e-8 in run1 (negligible). Even lambda=0.1 insufficient when applied to already-trained gates. True sparsity requires lambda >> 0.1 from epoch 1 — tradeoff: sparsity forces lower performance."
+}
