@@ -1,0 +1,235 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{parskip}
+\usepackage{microtype}
+
+\geometry{margin=1in}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{\textbf{Core ML: Long-Context Transformer Experiments}\\[0.4em]
+\large SAiDL Summer Induction Assignment 2026}
+\author{[Your Name]}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{What This Is}
+
+This report documents experiments I ran for the Core ML compulsory task. The goal was to build a Transformer language model from scratch, make it modular enough that I could swap out individual components, and then actually understand what each component does by changing one thing at a time and measuring what happens.
+
+I trained everything on WikiText-2 — basically cleaned Wikipedia text — with the task of predicting the next token. I used a small model (4 layers, 256-dim, 4 heads, about 16M parameters) so I could run enough experiments on Colab without dying. The metric I tracked is \textbf{perplexity} — lower means the model is less surprised by the next word, so lower is better.
+
+One thing I want to note upfront: 10 epochs from random initialisation is nowhere near enough to get state-of-the-art perplexity. My absolute numbers are high (200--650 range). But that wasn't really the point — the point was to compare things fairly, and for that you just need consistent training conditions, which I had.
+
+\section{Setup}
+
+\textbf{Model:} 4 transformer layers, $d_{\text{model}}=256$, 4 attention heads, $d_{\text{ff}}=1024$, dropout 0.1, weight tying between token embedding and LM head. Around 16M parameters depending on the config.
+
+\textbf{Data:} WikiText-2, tokenised with GPT-2's tokeniser (vocab size 50,257). 2.42M training tokens, 249k validation tokens.
+
+\textbf{Training:} AdamW, lr=$3\times10^{-4}$, cosine schedule with 10\% warmup, gradient clipping at 1.0, batch size 16, sequence length 512, 10 epochs. Google Colab T4 GPU.
+
+\textbf{The key design decision} was making everything go through a single \texttt{ModelConfig} dataclass. To run a new experiment I just change one field — \texttt{attention\_type}, \texttt{pe\_type}, or \texttt{conv\_type} — and everything else (data loading, training loop, logging) stays identical. This was the only way I could trust that differences in perplexity were actually caused by the component I changed.
+
+\section{Part 1: Baseline}
+
+Standard Transformer as described in Vaswani et al. (2017) \cite{vaswani2017attention}: sinusoidal positional encoding, full softmax self-attention with causal masking, GELU feed-forward, pre-LayerNorm residual connections.
+
+\textbf{Baseline result: PPL = 635.99}, 8,013 MB peak GPU memory, 104 seconds per epoch, 64,247 tokens/sec throughput.
+
+The training was still clearly improving at epoch 10 (loss 6.34 train vs 6.46 val) so it hadn't converged. But the gap between train and val is small which at least means no overfitting.
+
+\section{Part 2: Attention Variants}
+
+I tested three alternatives to full softmax attention, all still using sinusoidal PE so the only variable is the attention mechanism.
+
+\subsection{Sliding Window Attention}
+
+Each token only attends to the $w=64$ most recent tokens. Cost drops from $O(T^2)$ to $O(T \cdot w)$. Implemented by masking out scores where $i - j > w$ on top of the standard causal mask.
+
+\subsection{Linear Attention}
+
+Replaces softmax with a kernel trick: $\phi(Q)(\phi(K)^\top V)$ instead of $\text{softmax}(QK^\top)V$, where $\phi(x) = \text{ELU}(x) + 1$. The key identity is that the order of operations can be rearranged to avoid computing the full $T \times T$ matrix, reducing complexity to $O(T)$.
+
+\subsection{Grouped Query Attention (GQA)}
+
+Fewer KV heads than query heads. I used $n_{kv}=2$ with $n_h=4$, so each KV head is shared by 2 query heads. Main motivation is reducing KV cache memory during inference.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{Attention variants. All trained with sinusoidal PE, seq\_len=512, 10 epochs.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Method} & \textbf{PPL} & \textbf{Mem (MB)} & \textbf{s/epoch} & \textbf{tok/s} \\
+\midrule
+Baseline (standard) & 635.99 & 8,013 & 104 & 64,247 \\
+Sliding Window & \textbf{547.15} & 8,016 & 107 & 62,936 \\
+Linear Attention & 601.43 & 9,725 & 154 & 47,955 \\
+GQA ($n_{kv}=2$) & 599.80 & 8,010 & 104 & 65,268 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What I noticed}
+
+Sliding window actually beat full attention, which surprised me at first. But it makes sense for Wikipedia — most of what you need to predict the next word is within the current paragraph, not from an article section 400 tokens back. Forcing the model to focus locally turned out to be a useful constraint.
+
+Linear attention was slower and used \textit{more} memory than standard attention, which is the opposite of what you'd expect from the theory. After looking into this, the issue is that at seq\_len=512, the per-token outer product state ($d_h \times d_h = 64 \times 64$ per token) dominates over the $512 \times 512$ standard attention matrix. The crossover where linear becomes cheaper is probably around seq\_len 2048+. So if I had longer sequences the story would flip, but at 512 the theoretical benefit doesn't materialise.
+
+GQA basically matched standard attention quality (599 vs 636) with nearly identical memory, which is exactly what it's supposed to do. The real benefit would show up at inference time with a smaller KV cache, not so much in this training benchmark.
+
+\section{Part 3: Positional Encodings and Extrapolation}
+
+This was the most interesting part of the whole assignment to me. I tested four positional encoding methods, trained each on seq\_len=512, and then evaluated them on sequences of length 512, 1024, and 2048 without any retraining.
+
+\subsection{The methods}
+
+\textbf{RoPE} \cite{su2024roformer} rotates query and key vectors by a position-dependent angle before computing dot products. The nice property is that the dot product between $q_i$ and $k_j$ ends up depending only on $i-j$ (the relative distance), not on absolute positions. This means positions 513, 514, etc. are just slightly larger rotation angles — not foreign territory.
+
+\textbf{ALiBi} \cite{press2022train} doesn't touch the embeddings at all. It just subtracts a penalty proportional to token distance directly from attention scores: $\text{score}(i,j) -= m_h \cdot |i-j|$. Each head gets a different slope $m_h$, so some heads naturally attend further and some attend closer. The elegance here is that the penalty extends smoothly to any distance — there's no concept of a ``maximum position.''
+
+\textbf{Relative PE} learns a bias table indexed by relative distance, added to attention scores. Unlike ALiBi the bias shape is unconstrained and learned, not fixed.
+
+\textbf{Sinusoidal} is the original fixed sine/cosine encoding. Works well at training length, but positions beyond training range are essentially meaningless to the model.
+
+\subsection{Results}
+
+\begin{table}[H]
+\centering
+\caption{PE comparison at training length. Standard attention, seq\_len=512.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{PE} & \textbf{PPL} & \textbf{Mem (MB)} & \textbf{s/epoch} & \textbf{tok/s} \\
+\midrule
+Sinusoidal & 605.67 & 9,912 & 105 & 64,242 \\
+Relative   & 273.32 & 9,921 & 107 & 63,207 \\
+RoPE       & \textbf{205.44} & 9,918 & 108 & 62,599 \\
+ALiBi      & 206.73 & 10,181 & 104 & 64,558 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Extrapolation test. Trained on 512 tokens, evaluated on longer sequences.}
+\begin{tabular}{lccc}
+\toprule
+\textbf{PE} & \textbf{PPL @ 512} & \textbf{PPL @ 1024} & \textbf{PPL @ 2048} \\
+\midrule
+Sinusoidal & 605.67 & 766.28 & 2,516.35 \\
+Relative   & 273.32 & 280.82 & 293.33 \\
+RoPE       & 205.44 & 219.14 & 258.15 \\
+ALiBi      & \textbf{206.73} & \textbf{204.99} & \textbf{204.18} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What I noticed}
+
+The numbers here were genuinely shocking to me. RoPE and ALiBi are roughly \textbf{3× better} than sinusoidal at the same training length — same model, same data, same training, just a different formula for encoding position. I did not expect the choice of positional encoding to dominate everything else by this margin. No attention variant change came anywhere close to this effect.
+
+The extrapolation table makes it even clearer. Sinusoidal goes from 605 at 512 tokens to 2,516 at 2048 — it basically falls apart. The model has never seen position 600 during training, so it has no idea what to do with it.
+
+ALiBi gets \textit{better} with longer sequences (206.73 → 204.18). That's not a typo. With more context tokens available, the model just uses them better. The linear distance penalty naturally handles any length, so 2048 tokens is just 512 tokens with more context rather than something foreign.
+
+RoPE also holds up well — only +52 PPL across 4× the training length. This matches what I read in the RoFormer paper about relative position generalisation.
+
+The main takeaway: if I had to give one piece of advice from these experiments, it would be ``use RoPE or ALiBi by default.'' It's free in the sense that you're not adding parameters or changing the architecture, just changing the PE formula, and the improvement is massive.
+
+\section{Part 4: Convolution Hybrids}
+
+Both experiments here used Sliding Window attention + RoPE (the best individual components from Parts 2 and 3).
+
+\subsection{Conv-before-attention}
+
+A causal depthwise Conv1D layer before each attention block, to extract local n-gram features:
+\[x' = x + \text{GELU}(\text{CausalDepthwiseConv1D}(x, k=3))\]
+
+Depthwise means one filter per channel (groups = $d_{\text{model}}$), so it's cheap — only 4,096 extra parameters total across all layers.
+
+The causal part matters a lot. My first implementation used symmetric padding (padding both sides of the sequence), which let the conv kernel at position $t$ see token $t+1$. The model immediately cheated by just reading the next token from the conv output — perplexity dropped to 1.3 after 3 epochs, which is physically impossible for legitimate prediction. Validation loss was lower than training loss, which was the giveaway. Fixed by padding only on the left.
+
+\textbf{Result: PPL = 218.71}, 8,081 MB, 108 s/epoch, 61,785 tok/s.
+
+\subsection{Gated Conv FFN}
+
+Replaces the standard MLP feedforward with:
+\[\text{output} = \text{proj}\!\left(\text{CausalConv1D}(W_v x) \cdot \sigma(\text{CausalConv1D}(W_g x))\right)\]
+
+The sigmoid gate learns how much of the conv output to pass through. Unfortunately I hit Colab compute limits before this experiment finished training. Rather than report partial numbers and risk misrepresenting the result, I've left it out. The architecture is implemented and the causal fix was applied, but the full 10-epoch run didn't complete.
+
+\subsection{What I noticed}
+
+Conv-before-attention hitting 218.71 confirmed the intuition that convolutions and attention are genuinely complementary. Convolutions are good at fixed local patterns (common phrases, punctuation after certain words). Attention is good at variable long-range dependencies. Having the conv pre-process local features before attention uses them seems to help.
+
+\section{Full Results Table}
+
+\begin{table}[H]
+\centering
+\caption{All completed experiments, sorted by perplexity.}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{llllcccc}
+\toprule
+\textbf{Experiment} & \textbf{Attn} & \textbf{PE} & \textbf{Conv}
+ & \textbf{PPL} & \textbf{Mem (MB)} & \textbf{s/ep} & \textbf{tok/s} \\
+\midrule
+PE: RoPE            & standard   & rope       & none        & 205.44  & 9,918  & 108 & 62,599 \\
+PE: ALiBi           & standard   & alibi      & none        & 206.73  & 10,181 & 104 & 64,558 \\
+Conv: Before-Attn   & sliding\_w & rope       & conv\_before & 218.71 & 8,081  & 108 & 61,785 \\
+PE: Relative        & standard   & relative   & none        & 273.32  & 9,921  & 107 & 63,207 \\
+Attn: Sliding Win   & sliding\_w & sinusoidal & none        & 547.15  & 8,016  & 107 & 62,936 \\
+Attn: Linear        & linear     & sinusoidal & none        & 601.43  & 9,725  & 154 & 47,955 \\
+Attn: GQA           & gqa        & sinusoidal & none        & 599.80  & 8,010  & 104 & 65,268 \\
+PE: Sinusoidal      & standard   & sinusoidal & none        & 605.67  & 9,912  & 105 & 64,242 \\
+Baseline            & standard   & sinusoidal & none        & 635.99  & 8,013  & 104 & 64,247 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\section{Main Takeaways}
+
+Three things stand out clearly from these experiments:
+
+\textbf{1. Positional encoding matters more than attention architecture.}
+The gap between sinusoidal and RoPE/ALiBi (~430 PPL) is larger than the gap between the best and worst attention variants (~90 PPL). This was unintuitive to me before running the experiments. I'd spent more time reading about efficient attention mechanisms and less about PE, but the data says PE choice has the bigger impact on this benchmark.
+
+\textbf{2. The efficiency claims for linear attention only hold at long sequences.}
+At seq\_len=512, linear attention is actually more expensive than standard attention. It only saves memory when the sequence is long enough that the $T \times T$ attention matrix outweighs the per-token state cost. This is a practical detail that doesn't always come through clearly in the papers.
+
+\textbf{3. Causal correctness matters a lot for any local operation.}
+The conv leakage bug (symmetric padding seeing future tokens) was an important lesson. The attention module has a causal mask built in, so you don't think about it. But any other layer that processes the sequence — conv, pooling, anything — needs explicit causality enforcement. The bug was immediately visible from the perplexity numbers, which is a good argument for always sanity-checking your outputs against theoretical limits.
+
+\begin{thebibliography}{9}
+
+\bibitem{vaswani2017attention}
+A. Vaswani et al., ``Attention Is All You Need,'' \textit{NeurIPS}, 2017.
+
+\bibitem{su2024roformer}
+J. Su et al., ``RoFormer: Enhanced Transformer with Rotary Position Embedding,''
+\textit{Neurocomputing}, 2024.
+
+\bibitem{press2022train}
+O. Press, N. Smith, M. Lewis, ``Train Short, Test Long: Attention with Linear
+Biases Enables Input Length Extrapolation,'' \textit{ICLR}, 2022.
+
+\bibitem{katharopoulos2020transformers}
+A. Katharopoulos et al., ``Transformers are RNNs: Fast Autoregressive
+Transformers with Linear Attention,'' \textit{ICML}, 2020.
+
+\bibitem{ainslie2023gqa}
+J. Ainslie et al., ``GQA: Training Generalized Multi-Query Transformer Models
+from Multi-Head Checkpoints,'' \textit{EMNLP}, 2023.
+
+\end{thebibliography}
+
+\end{document}

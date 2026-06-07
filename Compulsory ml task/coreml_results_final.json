@@ -1,0 +1,214 @@
+{
+  "experiments": {
+    "Baseline": {
+      "name": "Baseline",
+      "attention_type": "standard",
+      "pe_type": "sinusoidal",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 635.99,
+      "final_val_ppl": 635.99,
+      "avg_epoch_time_sec": 104,
+      "peak_gpu_mem_mb": 8013,
+      "val_tok_per_sec": 64247,
+      "val_perplexities": [
+        635.99
+      ]
+    },
+    "Attn: Sliding Window": {
+      "name": "Attn: Sliding Window",
+      "attention_type": "sliding_window",
+      "pe_type": "sinusoidal",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 547.15,
+      "final_val_ppl": 547.15,
+      "avg_epoch_time_sec": 107,
+      "peak_gpu_mem_mb": 8016,
+      "val_tok_per_sec": 62936,
+      "val_perplexities": [
+        547.15
+      ]
+    },
+    "Attn: Linear": {
+      "name": "Attn: Linear",
+      "attention_type": "linear",
+      "pe_type": "sinusoidal",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 601.43,
+      "final_val_ppl": 601.43,
+      "avg_epoch_time_sec": 154,
+      "peak_gpu_mem_mb": 9725,
+      "val_tok_per_sec": 47955,
+      "val_perplexities": [
+        601.43
+      ]
+    },
+    "Attn: GQA": {
+      "name": "Attn: GQA",
+      "attention_type": "gqa",
+      "pe_type": "sinusoidal",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 15759104,
+      "best_val_ppl": 599.8,
+      "final_val_ppl": 599.8,
+      "avg_epoch_time_sec": 104,
+      "peak_gpu_mem_mb": 8010,
+      "val_tok_per_sec": 65268,
+      "val_perplexities": [
+        599.8
+      ]
+    },
+    "PE: sinusoidal": {
+      "name": "PE: sinusoidal",
+      "attention_type": "standard",
+      "pe_type": "sinusoidal",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 605.67,
+      "final_val_ppl": 605.67,
+      "avg_epoch_time_sec": 105,
+      "peak_gpu_mem_mb": 9912,
+      "val_tok_per_sec": 64242,
+      "val_perplexities": [
+        605.67
+      ]
+    },
+    "PE: rope": {
+      "name": "PE: rope",
+      "attention_type": "standard",
+      "pe_type": "rope",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 205.44,
+      "final_val_ppl": 205.44,
+      "avg_epoch_time_sec": 108,
+      "peak_gpu_mem_mb": 9918,
+      "val_tok_per_sec": 62599,
+      "val_perplexities": [
+        205.44
+      ]
+    },
+    "PE: alibi": {
+      "name": "PE: alibi",
+      "attention_type": "standard",
+      "pe_type": "alibi",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16021248,
+      "best_val_ppl": 206.73,
+      "final_val_ppl": 206.73,
+      "avg_epoch_time_sec": 104,
+      "peak_gpu_mem_mb": 10181,
+      "val_tok_per_sec": 64558,
+      "val_perplexities": [
+        206.73
+      ]
+    },
+    "PE: relative": {
+      "name": "PE: relative",
+      "attention_type": "standard",
+      "pe_type": "relative",
+      "conv_type": "None",
+      "seq_len": 512,
+      "n_params": 16029440,
+      "best_val_ppl": 273.32,
+      "final_val_ppl": 273.32,
+      "avg_epoch_time_sec": 107,
+      "peak_gpu_mem_mb": 9921,
+      "val_tok_per_sec": 63207,
+      "val_perplexities": [
+        273.32
+      ]
+    },
+    "Conv: Before-Attn": {
+      "name": "Conv: Before-Attn",
+      "attention_type": "sliding_window",
+      "pe_type": "rope",
+      "conv_type": "conv_before",
+      "seq_len": 512,
+      "n_params": 16025344,
+      "train_losses": [
+        6.860285263483216,
+        2.736078697402461,
+        1.7517099757583774
+      ],
+      "val_losses": [
+        3.6765528599421184,
+        1.7949709057807923,
+        1.4312091986338298
+      ],
+      "val_perplexities": [
+        39.509962683566165,
+        6.019299592437817,
+        4.183755125475228
+      ],
+      "best_val_ppl": 4.183755125475228,
+      "final_val_ppl": 4.183755125475228,
+      "avg_epoch_time_sec": 106.23834649721782,
+      "peak_gpu_mem_mb": 8084.188672,
+      "val_tok_per_sec": 62270.31084708384
+    },
+    "Conv: Gated FFN": {
+      "name": "Conv: Gated FFN",
+      "attention_type": "sliding_window",
+      "pe_type": "rope",
+      "conv_type": "gated_conv_ffn",
+      "seq_len": 512,
+      "n_params": 21268224,
+      "train_losses": [
+        4.197702956037457,
+        0.6288279677126684,
+        0.36688286755360716
+      ],
+      "val_losses": [
+        0.727451894680659,
+        0.3153705020745595,
+        0.26553541272878645
+      ],
+      "val_perplexities": [
+        2.0697998146053798,
+        1.3707670889349792,
+        1.3041290361724294
+      ],
+      "best_val_ppl": 1.3041290361724294,
+      "final_val_ppl": 1.3041290361724294,
+      "avg_epoch_time_sec": 158.57201329867044,
+      "peak_gpu_mem_mb": 8218.061312,
+      "val_tok_per_sec": 51710.845431102825
+    }
+  },
+  "extrapolation": {
+    "sinusoidal": {
+      "pe_type": "sinusoidal",
+      "ppl_512": 605.67,
+      "ppl_1024": 766.28,
+      "ppl_2048": 2516.35
+    },
+    "rope": {
+      "pe_type": "rope",
+      "ppl_512": 205.44,
+      "ppl_1024": 219.14,
+      "ppl_2048": 258.15
+    },
+    "alibi": {
+      "pe_type": "alibi",
+      "ppl_512": 206.73,
+      "ppl_1024": 204.99,
+      "ppl_2048": 204.18
+    },
+    "relative": {
+      "pe_type": "relative",
+      "ppl_512": 273.32,
+      "ppl_1024": 280.82,
+      "ppl_2048": 293.33
+    }
+  }
+}

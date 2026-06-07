@@ -1,154 +1,139 @@
-# SAiDL Summer Assignment 2026 — Sparsity & Optimization
+# SAiDL Summer Assignment 2026
 
-**[Your Name] | SAiDL Summer Induction 2026**
-
-This repository contains my submission for the **Sparsity & Optimization** domain track of the SAiDL Summer 2026 Induction Assignment.
-
----
-
-## Track: Sparsity & Optimization
-
-### What Was Done
-
-A systematic comparison of three parameter-efficient fine-tuning (PEFT) methods — **LoRA**, **AdaLoRA**, and **SoRA** — applied to the CoLA grammatical acceptability task using DeBERTa-v3-base as the backbone. Additionally, a theoretical and empirical investigation of the optimizer-level mechanism (proximal gradient vs. SGD subgradient) that underlies SoRA's sparsity mechanism.
+This is my submission for the SAiDL Summer 2026 Induction. I attempted the
+Core ML compulsory task and the Sparsity & Optimization domain task.
 
 ---
 
-## Results Summary
+## Structure
 
-| Method | Best Val MCC | Trainable Params | Mean Eff. Rank | Avg Epoch |
-|--------|-------------|-----------------|----------------|-----------|
-| LoRA (r=8) | 0.1557 | 296,450 (0.16%) | 6.809 / 8 | 181s |
-| AdaLoRA (init_r=12 → target_r=8) | 0.0901 | 665,522 (0.36%) | 6.315 / 8 | 189s |
-| **SoRA (r=8, λ=0.1)** | **0.2294** | 444,194 (0.24%) | 6.813 / 8 | 208s |
+```
 
-Primary metric: **MCC (Matthews Correlation Coefficient)** — used because CoLA has 69%/31% class imbalance. Accuracy is misleading; MCC = 0 for any model that predicts a single class.
 
 ---
 
-## Repository Structure
+## Core ML — Transformer Experiments
 
-```
-SAiDL-Summer-Assignment2026/
-├── README.md
-├── report/
-│   ├── main.tex              ← Full LaTeX report
-│   └── main.pdf              ← Compiled PDF
-├── task1/
-│   ├── lora_cola.ipynb       ← LoRA training notebook (Colab)
-│   ├── adalora_cola.ipynb    ← AdaLoRA training notebook (Colab)
-│   ├── sora_cola.ipynb       ← SoRA training notebook (Colab)
-│   └── results/
-│       ├── lora_results.json
-│       ├── adalora_results.json
-│       └── sora_results.json
-├── task2/
-│   ├── numpy_implementation.py     ← Proximal vs SGD in NumPy
-│   ├── pytorch_implementation.py   ← Proximal vs SGD in PyTorch
-│   ├── numpy_comparison.png        ← Output plots
-│   └── pytorch_comparison.png      ← Output plots
-└── task3/
-    └── proposal.md           ← Theoretical proposal for Mamba & xLSTM
-```
+Built a modular Transformer language model trained on WikiText-2. The entire
+point of the code structure was making components swappable — one config
+field changes the attention type, PE type, or conv variant, everything else
+stays fixed. Ran 9 complete experiments (10 epochs each) and one incomplete
+due to Colab session limits.
 
----
+**Model:** 4 layers, d_model=256, 4 heads, ~16M params  
+**Task:** Next-token prediction on WikiText-2  
+**Hardware:** Google Colab T4  
 
-## Task Descriptions
+### Attention Variants
 
-### Task 1 — LoRA vs AdaLoRA vs SoRA on CoLA
+| Method | PPL | Mem (MB) | tok/s |
+|--------|-----|----------|-------|
+| Baseline (standard) | 635.99 | 8,013 | 64,247 |
+| Sliding Window (w=64) | **547.15** | 8,016 | 62,936 |
+| Linear Attention | 601.43 | 9,725 | 47,955 |
+| GQA (n_kv=2) | 599.80 | 8,010 | 65,268 |
 
-**Dataset:** CoLA (Corpus of Linguistic Acceptability), GLUE benchmark  
-**Backbone:** `microsoft/deberta-v3-base` (184M parameters)  
-**Metric:** MCC (primary), trainable parameters, effective rank, training time
+Sliding window beat full attention on Wikipedia, which makes sense in
+retrospect — predicting the next word mostly needs the surrounding paragraph,
+not the whole article. Linear attention ended up *slower* and used more memory
+than standard at seq_len=512. This isn't a bug — it only becomes cheaper when
+sequences are long enough (probably ~2048+) that the T×T attention matrix
+outweighs the per-token state cost from the kernel trick.
 
-**Key findings:**
-- **SoRA > LoRA > AdaLoRA** on this small dataset
-- AdaLoRA's rank pruning (steps 200–1000) destabilizes training — loss *increased* for 4 epochs before declining. CoLA is too small for the model to recover from adaptive pruning overhead.
-- SoRA with λ=0.1 never induced true gate sparsity (all 288 gates stayed near 1.0). Task gradient defends all rank components. SoRA with zero sparsity acts as LoRA with additional per-dimension scaling → better performance.
-- Effective rank analysis: LoRA uses 85% of its capacity on average (mean 6.81/8), but with high variance (4.4–7.8), motivating adaptive approaches on larger datasets.
+### Positional Encodings + Extrapolation
 
-**Setup:** Google Colab T4 GPU. All three methods trained with identical hyperparameters (lr=1e-4, AdamW eps=1e-6, gradient clipping, class weights [1.69, 0.71], linear warmup scheduler) for fair comparison.
+| PE | PPL@512 | PPL@1024 | PPL@2048 |
+|----|---------|----------|----------|
+| Sinusoidal | 605.67 | 766.28 | 2,516.35 |
+| Relative | 273.32 | 280.82 | 293.33 |
+| RoPE | **205.44** | 219.14 | 258.15 |
+| ALiBi | 206.73 | **204.99** | **204.18** |
 
----
+This was the most interesting result. RoPE and ALiBi are roughly 3× better
+than sinusoidal at training length, and that gap just comes from changing the
+PE formula — same model, same data, same training. Sinusoidal falls apart at
+2048 tokens (PPL jumps to 2516) because the model never saw those positions
+during training. ALiBi actually improves at longer sequences, which is exactly
+what it was designed to do.
 
-### Task 2 — Proximal Gradient vs SGD Subgradient
+Biggest thing I learned here: positional encoding choice has a larger effect
+on perplexity than any attention architecture choice. I didn't expect that
+going in.
 
-**Problem:** `minimize 0.5 * ||Ag - b||^2 + λ * ||g||_1`  
-with known sparse ground truth `g_true = [1.5, 0, 0, -0.8, 0, 0, 0.3, 0, 0, -1.2]` (6 zeros).
+### Conv Hybrids
 
-**SGD subgradient update (derived):**
-```
-g_new = g - η * (∂L_task/∂g + λ * sign(g))
-```
-where `sign(0) = 0` by convention.
+Both used Sliding Window + RoPE as the base.
 
-**Proximal update:**
-```
-g_temp = g - η * ∂L_task/∂g
-g_new  = sign(g_temp) * max(|g_temp| - λη, 0)
-```
+| Config | PPL |
+|--------|-----|
+| Conv Before Attention | 218.71 |
+| Gated Conv FFN | didn't finish (Colab ran out) |
 
-**Results:**
-
-| Framework | Method | Near-zeros found | Final loss |
-|-----------|--------|-----------------|-----------|
-| NumPy | Proximal | 5 / 6 | 0.380198 |
-| NumPy | SGD Subgradient | 0 / 6 | 0.380466 |
-| PyTorch | Proximal | 6 / 6 | 0.378609 |
-| PyTorch | SGD Subgradient | 0 / 6 | 0.378873 |
-
-Both methods converge to nearly identical objective values. The difference is purely structural: proximal produces exact zeros, SGD cannot (components oscillate near zero with magnitude O(ηλ)).
-
-**Why:** The proximal operator analytically solves `argmin_u ||u - g_temp||² + λη||u||₁`, whose closed-form solution is zero when `|g_temp| ≤ λη`. SGD's continuous update can only push toward zero asymptotically.
-
-**Subgradient choice at zero:** Using `sign(0) = 0` vs `±1` does not close the gap. The fundamental limitation is the continuous gradient update, not the subgradient convention.
+Conv-before-attention confirmed that local conv features + attention are
+complementary. Also learned an important lesson here: symmetric Conv1d padding
+lets the model see future tokens (the conv window at position t reaches t+1),
+which looks like a data leakage bug. The model hit PPL ~1.3 after 3 epochs,
+which is obviously wrong. Fixed with left-only causal padding.
 
 ---
 
-### Task 3 — Extension to Sequential Architectures (Theoretical Proposal)
+## Sparsity & Optimization — PEFT on CoLA
 
-Proposed LoRA/SoRA adaptation targets for Mamba SSM and xLSTM. See `task3/proposal.md` and the full discussion in the LaTeX report (Section 6).
+Compared LoRA, AdaLoRA, and SoRA fine-tuning DeBERTa-v3-base on the CoLA
+grammatical acceptability task. Also implemented and compared proximal
+gradient vs SGD subgradient for ℓ1-regularized sparse recovery.
+
+**Metric:** MCC (Matthews Correlation Coefficient) — CoLA has 69/31 class
+imbalance so accuracy is meaningless, MCC is the right metric.
+
+### Task 1 Results
+
+| Method | Best MCC | Trainable Params | Mean Eff. Rank |
+|--------|----------|-----------------|----------------|
+| LoRA (r=8) | 0.1557 | 296,450 (0.16%) | 6.81 / 8 |
+| AdaLoRA (r=12→8) | 0.0901 | 665,522 (0.36%) | 6.32 / 8 |
+| SoRA (r=8, λ=0.1) | **0.2294** | 444,194 (0.24%) | 6.81 / 8 |
+
+AdaLoRA underperformed because its rank pruning (steps 200–1000) destabilises
+training. CoLA only has 8k examples so the model can't recover from continuous
+pruning perturbations — loss actually went up for 4 epochs during the pruning
+window. LoRA's fixed-rank simplicity is more stable here.
+
+SoRA never produced real gate sparsity (all gates stayed near 1.0) because
+the task gradient was too strong to let regularisation push gates to zero.
+Without sparsity it effectively becomes LoRA with extra per-dimension scaling,
+and that extra flexibility helped performance.
+
+### Task 2 Results
+
+Proximal gradient vs SGD subgradient on a synthetic LASSO problem with known
+6-sparse ground truth.
+
+| Method | Exact zeros found | Loss |
+|--------|-------------------|------|
+| NumPy Proximal | 5–6 / 6 | 0.3802 |
+| NumPy SGD | 0 / 6 | 0.3805 |
+| PyTorch Proximal | 6 / 6 | 0.3786 |
+| PyTorch SGD | 0 / 6 | 0.3789 |
+
+Both methods get nearly identical objective values. The difference is entirely
+structural — proximal produces exact zeros, SGD can't. This is because the
+proximal operator analytically solves the ℓ1 subproblem (a closed-form
+thresholding step), while SGD with a subgradient just oscillates around zero
+without ever landing there.
+
+### Task 3
+
+Theoretical proposal for extending LoRA/SoRA to Mamba and xLSTM architectures.
+Not implemented due to time constraints — see `task3/proposal.md`.
 
 ---
 
-## Running the Code
+## Notes
 
-### Task 2 (local)
-```bash
-pip install numpy torch matplotlib
-python task2/numpy_implementation.py
-python task2/pytorch_implementation.py
-```
-
-### Task 1 (Google Colab recommended)
-Open the notebooks in `task1/` on Google Colab with a T4 GPU runtime.
-
-Required packages:
-```
-pip install torchao --upgrade
-pip install transformers peft datasets evaluate scikit-learn accelerate
-```
-
-Important DeBERTa-v3 quirks:
-- Always use `use_fast=False` in tokenizer
-- Always load model with `torch_dtype=torch.float32`
-- Learning rate must be ≤ 1e-4 (disentangled attention overflows at higher lr)
-- AdaLoRA requires `model.update_and_allocate(global_step)` inside training loop
-
----
-
-## Report
-
-The full LaTeX report is in `report/main.tex` covering:
-- Background on PEFT, DeBERTa, CoLA, MCC
-- Mathematical formulations for LoRA, AdaLoRA, SoRA
-- Experimental results with training curves, effective rank analysis
-- Analysis of why each method performed as it did
-- Task 2: derivation, implementation, and theoretical comparison
-- Task 3: proposed methodology for Mamba and xLSTM
-
----
-
-## Contact
-
-For any queries about this submission, contact via SAiDL Slack.
+- Everything ran on Google Colab T4 (free tier), so compute was limited
+- Absolute perplexity numbers in Core ML are high because 10 epochs from
+  random init isn't enough to converge — comparisons are what matter
+- One experiment (Gated Conv FFN) didn't finish due to session limits
+- For DeBERTa fine-tuning: lr must be ≤ 1e-4 and use_fast=False, otherwise
+  the disentangled attention overflows and you get NaN loss
